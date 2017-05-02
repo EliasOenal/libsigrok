@@ -2,6 +2,7 @@
  * This file is part of the libsigrok project.
  *
  * Copyright (C) 2013 Marc Schink <sigrok-dev@marcschink.de>
+ * Copyright (C) 2017 Elias Oenal <sigrok@eliasoenal.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,6 +26,7 @@
 #include "libsigrok-internal.h"
 
 #define LOG_PREFIX "input/csv"
+#define BUFFER_MULTIPLIER 131072
 
 /*
  * The CSV input module has the following options:
@@ -128,6 +130,12 @@ struct context {
 
 	/* Buffer to store sample data. */
 	uint8_t *sample_buffer;
+
+	/* Collects several samples in order to improve performance */
+	uint8_t* multi_sample_buffer;
+
+	/* Current count of samples */
+	size_t multi_sample_buffer_count;
 
 	/* Current line number. */
 	size_t line_number;
@@ -362,18 +370,15 @@ static int send_samples(const struct sr_dev_inst *sdi, uint8_t *buffer,
 	struct sr_datafeed_packet packet;
 	struct sr_datafeed_logic logic;
 	int res;
-	gsize i;
 
 	packet.type = SR_DF_LOGIC;
 	packet.payload = &logic;
 	logic.unitsize = buffer_size;
-	logic.length = buffer_size;
+	logic.length = buffer_size * count;
 	logic.data = buffer;
 
-	for (i = 0; i < count; i++) {
-		if ((res = sr_session_send(sdi, &packet)) != SR_OK)
-			return res;
-	}
+	if ((res = sr_session_send(sdi, &packet)) != SR_OK)
+		return res;
 
 	return SR_OK;
 }
@@ -390,6 +395,8 @@ static int init(struct sr_input *in, GHashTable *options)
 	inc->multi_column_mode = inc->single_column == 0;
 
 	inc->num_channels = g_variant_get_int32(g_hash_table_lookup(options, "numchannels"));
+
+	inc->multi_sample_buffer_count = 0;
 
 	inc->delimiter = g_string_new(g_variant_get_string(
 			g_hash_table_lookup(options, "delimiter"), NULL));
@@ -555,8 +562,9 @@ static int initial_parse(const struct sr_input *in, GString *buf)
 	 * Calculate the minimum buffer size to store the sample data of the
 	 * channels.
 	 */
-	inc->sample_buffer_size = (inc->num_channels + 7) >> 3;
-	inc->sample_buffer = g_malloc(inc->sample_buffer_size);
+	inc->sample_buffer_size = ((inc->num_channels + 7) >> 3);
+	inc->multi_sample_buffer = g_malloc(inc->sample_buffer_size * BUFFER_MULTIPLIER);
+	inc->sample_buffer = inc->multi_sample_buffer;
 
 out:
 	if (columns)
@@ -599,7 +607,7 @@ static int initial_receive(const struct sr_input *in)
 	return ret;
 }
 
-static int process_buffer(struct sr_input *in)
+static int process_buffer(struct sr_input *in, gboolean flush_buffer)
 {
 	struct sr_datafeed_packet packet;
 	struct sr_datafeed_meta meta;
@@ -695,15 +703,37 @@ static int process_buffer(struct sr_input *in)
 			return SR_ERR;
 		}
 
+		if(inc->multi_sample_buffer_count >= (BUFFER_MULTIPLIER - 1))
+		{
+			/* Send sample data to the session bus. */
+			ret = send_samples(in->sdi, inc->multi_sample_buffer,
+				inc->sample_buffer_size, inc->multi_sample_buffer_count);
+			if (ret != SR_OK) {
+				sr_err("Sending samples failed.");
+				return SR_ERR;
+			}
+			inc->sample_buffer = inc->multi_sample_buffer;
+			inc->multi_sample_buffer_count = 0;
+		}
+		else
+		{
+			inc->sample_buffer += inc->sample_buffer_size;
+			inc->multi_sample_buffer_count++;
+		}
+		g_strfreev(columns);
+	}
+
+	if(inc->multi_sample_buffer_count && flush_buffer)
+	{
 		/* Send sample data to the session bus. */
-		ret = send_samples(in->sdi, inc->sample_buffer,
-			inc->sample_buffer_size, 1);
+		ret = send_samples(in->sdi, inc->multi_sample_buffer,
+			inc->sample_buffer_size, inc->multi_sample_buffer_count);
 		if (ret != SR_OK) {
 			sr_err("Sending samples failed.");
 			return SR_ERR;
 		}
-		g_strfreev(columns);
 	}
+
 	g_strfreev(lines);
 	g_string_erase(in->buf, 0, p - in->buf->str + 1);
 
@@ -730,7 +760,7 @@ static int receive(struct sr_input *in, GString *buf)
 		return SR_OK;
 	}
 
-	ret = process_buffer(in);
+	ret = process_buffer(in, FALSE);
 
 	return ret;
 }
@@ -741,7 +771,7 @@ static int end(struct sr_input *in)
 	int ret;
 
 	if (in->sdi_ready)
-		ret = process_buffer(in);
+		ret = process_buffer(in, TRUE);
 	else
 		ret = SR_OK;
 
@@ -765,7 +795,7 @@ static void cleanup(struct sr_input *in)
 		g_string_free(inc->comment, TRUE);
 
 	g_free(inc->termination);
-	g_free(inc->sample_buffer);
+	g_free(inc->multi_sample_buffer);
 }
 
 static int reset(struct sr_input *in)
